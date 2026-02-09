@@ -15,11 +15,11 @@ load_dotenv()
 # Page config
 st.set_page_config(
     page_title="Trading Card Grader AI",
-    page_icon="TC",
+    page_icon="",
     layout="wide"
 )
 
-# Custom CSS
+# Custom CSS (same as before)
 st.markdown("""
 <style>
     .main-header {
@@ -52,6 +52,8 @@ st.markdown("""
         font-weight: bold;
         margin-top: 1.5rem;
         margin-bottom: 0.5rem;
+        border-bottom: 2px solid #1E88E5;
+        padding-bottom: 0.5rem;
     }
     .recommendation-pass {
         background-color: #ff4444;
@@ -73,6 +75,13 @@ st.markdown("""
         padding: 1rem;
         border-radius: 10px;
         font-weight: bold;
+    }
+    .analysis-section {
+        background-color: #f8f9fa;
+        padding: 1.5rem;
+        border-radius: 10px;
+        margin: 1rem 0;
+        border-left: 4px solid #1E88E5;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -103,7 +112,6 @@ def extract_ebay_images(url):
         for item in carousel_items:
             img = item.find('img')
             if img:
-                # Try multiple attributes
                 for attr in ['data-zoom-src', 'data-src', 'src']:
                     src = img.get(attr)
                     if src and 'ebayimg.com' in src:
@@ -132,32 +140,15 @@ def extract_ebay_images(url):
                         image_urls.append(src)
                         break
         
-        # Method 4: Look in script tags for image URLs (JSON data)
-        if not image_urls:
-            scripts = soup.find_all('script', type='application/ld+json')
-            for script in scripts:
-                try:
-                    data = json.loads(script.string)
-                    if isinstance(data, dict) and 'image' in data:
-                        imgs = data['image']
-                        if isinstance(imgs, str):
-                            image_urls.append(imgs)
-                        elif isinstance(imgs, list):
-                            image_urls.extend(imgs)
-                except:
-                    pass
-        
         # Clean and upgrade URLs to highest quality
         cleaned_urls = []
         for img_url in image_urls:
-            # Upgrade to s-l1600 (highest quality)
             for size in ['s-l50', 's-l100', 's-l225', 's-l300', 's-l400', 's-l500', 
                         's-l640', 's-l960', 's-l1200']:
                 if size in img_url:
                     img_url = img_url.replace(size, 's-l1600')
                     break
             
-            # Only add if it's a product image
             if 'ebayimg.com' in img_url and 's-l' in img_url:
                 cleaned_urls.append(img_url)
         
@@ -169,7 +160,7 @@ def extract_ebay_images(url):
                 seen.add(img_url)
                 unique_urls.append(img_url)
         
-        result = unique_urls[:10]  # Limit to 10 images max
+        result = unique_urls[:10]
         
         if not result:
             st.warning("Could not extract images from this eBay listing. The page structure may have changed. Please try manual upload instead.")
@@ -193,14 +184,10 @@ def download_image(url):
 
 
 def prepare_image_for_api(img, max_dimension=1200, quality=85):
-    """
-    Prepare a single image for the API - resize and compress while keeping
-    enough detail for accurate card grading.
-    """
+    """Prepare a single image for the API"""
     img_copy = img.copy()
     img_copy.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
     
-    # Convert to RGB if needed (for JPEG encoding)
     if img_copy.mode in ('RGBA', 'LA', 'P'):
         background = Image.new('RGB', img_copy.size, (255, 255, 255))
         if img_copy.mode == 'P':
@@ -214,377 +201,252 @@ def prepare_image_for_api(img, max_dimension=1200, quality=85):
     return base64.b64encode(buffered.getvalue()).decode()
 
 
-def analyze_card_with_openai(images, api_key, batch_size=5):
+def analyze_card_with_openai(images, api_key):
     """
-    Analyze trading card images using OpenAI GPT-4o.
-    Sends all images in a single request when possible.
-    Falls back to two-pass approach only when request is too large.
+    Analyze trading card images using OpenAI GPT-4o with detailed, conversational output
+    that matches ChatGPT's analysis style
     """
     try:
         client = openai.OpenAI(api_key=api_key)
 
-        # Try sending all images at once first (best accuracy)
-        # If more than batch_size, reduce quality to fit
-        if len(images) <= batch_size:
-            return _call_grading_api(client, images, max_dim=1200, quality=85)
-        else:
-            # More images: use slightly lower quality to fit in one request
-            st.info(f"Processing {len(images)} images...")
-            return _call_grading_api(client, images, max_dim=1000, quality=75)
+        # New system prompt that encourages detailed, conversational analysis
+        system_message = """You are an expert PSA card grader with years of experience. You provide detailed, thorough analysis similar to how you would explain your assessment to a collector in person.
 
-    except openai.BadRequestError:
-        # If request is too large, split into 2 passes
-        st.warning("Images too large for single request. Running two-pass analysis...")
-        return _two_pass_analysis(client, images)
-    except Exception as e:
-        return {"error": str(e)}
+Your analysis should be:
+- Conversational and detailed, not just bullet points
+- Specific about what you see in each area (centering, corners, edges, surface)
+- Honest about both strengths and weaknesses
+- Clear about which issues matter most for the grade
+- Realistic about PSA grading standards
 
+PSA 10 requirements:
+- Centering: 50/50 to 60/40 front, 55/45 to 75/25 back
+- Corners: All four corners must be sharp with no visible wear
+- Edges: Clean, no chipping or roughness
+- Surface: No print defects, scratches, or other imperfections
 
-def _call_grading_api(client, images, max_dim=1200, quality=85):
-    """
-    Core API call: sends images with a structured sub-grade scoring prompt.
-    """
-    system_message = """You are a strict, experienced PSA card grader. You grade cards the same way 
-PSA does: each sub-category (centering, corners, edges, surface) gets its own score, 
-and the LOWEST sub-category score determines the final grade.
+Remember: PSA is STRICT. One small flaw can drop a card from a 10 to a 9. Be thorough and realistic."""
 
-KEY PRINCIPLE: In PSA grading, the final grade is limited by the WORST category. 
-A card with perfect surface but one soft corner is NOT a PSA 10 -- it is limited 
-by the corner score.
+        # New user prompt that asks for detailed analysis
+        user_message = [
+            {
+                "type": "text",
+                "text": """Please provide a detailed grading analysis of this trading card. Structure your response as follows:
 
-PSA Sub-Grade Scale (use for each category):
-  10 = Flawless in this category
-   9 = One very minor flaw
-   8 = A couple of minor flaws
-   7 = Several minor flaws or one moderate flaw
-   6 = Noticeable issues
-   5 or below = Significant problems
+**Card:** [Identify the card if possible]
 
-PSA Centering Requirements:
-  10: 50/50 to 60/40 front, 55/45 to 75/25 back
-   9: 60/40 to 65/35 front, up to 90/10 back  
-   8: 65/35 to 70/30 front, up to 90/10 back
-   7: 70/30 to 75/25 front
-   6 or below: worse than 75/25
+**What matters most here:** [List the key factors: corners, edges, centering, surface, auto quality if applicable]
 
-PHOTO QUALITY RULE: These are eBay listing photos -- they are designed to make cards 
-look good. Compressed images hide micro-defects (tiny corner whitening, hairline 
-scratches, slight edge wear). If you cannot clearly confirm a category is flawless 
-because photos lack the resolution or angle, you must cap that sub-grade at 8 maximum 
-and note it as a photo limitation. Do NOT assume perfection when you simply cannot see 
-enough detail."""
+---
 
-    user_message = [
-        {
-            "type": "text",
-            "text": """Grade this trading card using PSA standards with sub-category scoring.
+**Front**
 
-STEP 1 - Score each category individually (10 = perfect, 5 = significant issues):
+**Centering**
+- Describe the left/right and top/bottom centering
+- Give specific measurements if possible (e.g., "52/48")
+- Note if it meets PSA 10 standards
 
-  A. CENTERING: Measure border ratios on front (L/R, T/B) and back (L/R, T/B).
-     Compare to PSA centering chart. Give a centering sub-grade.
+**Corners**
+- Examine each corner individually (top left, top right, bottom left, bottom right)
+- Describe what you see (sharp, slight softness, whitening, etc.)
+- Be specific about any issues
 
-  B. CORNERS: Inspect each of the 4 corners on front AND back individually.
-     Look for: whitening, softness, dings, bends, rounding.
-     The WORST corner determines the corner sub-grade.
+**Edges**
+- Check all four edges
+- Note any chipping, silvering, or roughness
+- Mention if chrome/foil edges look clean
 
-  C. EDGES: Inspect all 4 edges on front AND back.
-     Look for: chipping, roughness, whitening, nicks, foil peeling.
-     The WORST edge determines the edge sub-grade.
+**Surface (Front)**
+- Check for print lines, scratches, indentations
+- Note the quality of the chrome/finish
+- Comment on centering of the auto if present
+- Assess auto ink quality (bold, clean, streaking, bubbling, etc.)
 
-  D. SURFACE: Inspect front AND back surfaces.
-     Look for: scratches, print lines, indentations, stains, creases, wax, 
-     fingerprints, factory defects, ink marks, scuffs.
-     The WORST surface issue determines the surface sub-grade.
+---
 
-STEP 2 - Calculate final grade:
-  Final grade = LOWEST sub-grade from the 4 categories above.
-  (Example: centering=9, corners=7, edges=8, surface=9 --> final grade = 7)
+**Back**
 
-STEP 3 - Determine recommendation based on the FINAL grade (not the best sub-grade):
-  - "Send for Grading": Final grade is 9 or higher
-  - "Hold": Final grade is 7 or 8
-  - "Pass": Final grade is 6 or below
+**Centering**
+- Describe back centering with measurements
+- Note PSA 10 acceptability
 
-STEP 4 - Assess confidence:
-  - "High": Clear close-up photos of all angles (front, back, corners, edges)
-  - "Medium": Decent photos but missing some close-ups or angles
-  - "Low": Only distant/blurry photos, many areas cannot be evaluated
+**Corners / Edges**
+- Compare to front
+- Note any additional issues or if back is cleaner
 
-Return ONLY this JSON:
-{
-    "centering_sub_grade": 8,
-    "corners_sub_grade": 7,
-    "edges_sub_grade": 8,
-    "surface_sub_grade": 9,
-    "estimated_grade_single": 7,
-    "estimated_grade_range": "PSA 7-8",
-    "psa_10_probability": 0.02,
-    "centering_front": "58/42 L-R, 52/48 T-B. Slightly left-heavy.",
-    "centering_back": "65/35 L-R, 55/45 T-B. Noticeably off-center left.",
-    "corners": "TL: sharp. TR: sharp. BL: slight softness. BR: minor whitening visible.",
-    "edges": "Top: clean. Bottom: clean. Left: minor roughness. Right: clean.",
-    "surface": "Front: no visible scratches. Back: possible light surface wear near center.",
-    "missing_angles": ["Close-up of bottom-left corner", "Edge detail shots"],
-    "key_issues": ["Back centering 65/35 limits grade", "BL corner softness", "Left edge roughness"],
-    "recommendation": "Hold",
-    "confidence": "Medium",
-    "detailed_notes": "Card is limited by back centering (65/35) and bottom-left corner softness. These cap the grade at PSA 7-8 range. Surface and front centering are strong but cannot overcome the weaker categories."
-}
+**Surface (Back)**
+- Check for scratches, print lines, or defects
+- Note any issues
 
-IMPORTANT: The final grade MUST equal the lowest sub-grade. Do not average them."""
-        }
-    ]
+---
 
-    # Attach all images
-    for img in images:
-        img_b64 = prepare_image_for_api(img, max_dimension=max_dim, quality=quality)
-        user_message.append({
-            "type": "image_url",
-            "image_url": {
-                "url": f"data:image/jpeg;base64,{img_b64}",
-                "detail": "high"
+**Serial Number Area** (if applicable)
+- Check for foil cracking or indenting around numbers
+
+---
+
+**Overall Probability**
+Floor: PSA [X]
+Ceiling: PSA [X]  
+Most Likely: PSA [X] if the grader is reasonable
+
+Why not guaranteed 10? [Explain the specific issue(s)]
+
+---
+
+**Auto Grade** (if applicable)
+If you dual grade:
+- Card: [X]-10 range
+- Auto: Very likely [X]
+
+---
+
+**Market Reality (Important)**
+[Discuss the value difference between grades for this specific card/player]
+[Give recommendation: "submit candidate" or "hold" or "pass"]
+
+---
+
+**Prep Advice Before Sending**
+- [List specific prep steps]
+
+Be thorough, conversational, and specific. Point out everything you notice."""
             }
-        })
+        ]
 
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": user_message}
-        ],
-        temperature=0.2,
-        max_tokens=2000
-    )
+        # Attach all images
+        for img in images:
+            img_b64 = prepare_image_for_api(img, max_dimension=1200, quality=85)
+            user_message.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{img_b64}",
+                    "detail": "high"
+                }
+            })
 
-    result_text = response.choices[0].message.content
-    return _parse_grading_response(result_text)
+        # Make API call
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_message}
+            ],
+            temperature=0.3,
+            max_tokens=3000
+        )
+
+        result_text = response.choices[0].message.content
+        
+        # Parse the response to extract key information
+        return parse_detailed_response(result_text)
+
+    except Exception as e:
+        return {"error": str(e), "raw_response": str(e)}
 
 
-def _two_pass_analysis(client, images):
+def parse_detailed_response(result_text):
     """
-    Fallback: split images into two halves, analyze each, 
-    then ask the AI to combine findings.
+    Parse the detailed conversational response and extract key metrics
+    while preserving the full detailed text
     """
-    mid = len(images) // 2
-    first_half = images[:mid]
-    second_half = images[mid:]
-
-    st.write(f"Pass 1: Analyzing images 1-{mid}...")
-    result1 = _call_grading_api(client, first_half, max_dim=1000, quality=75)
-    if "error" in result1:
-        return result1
-
-    st.write(f"Pass 2: Analyzing images {mid+1}-{len(images)}...")
-    result2 = _call_grading_api(client, second_half, max_dim=1000, quality=75)
-    if "error" in result2:
-        return result2
-
-    # Combine: take the worse (lower) sub-grade for each category
-    combined = result1.copy()
-    
-    # Take worst sub-grade from each category
-    for key in ['centering_sub_grade', 'corners_sub_grade', 'edges_sub_grade', 'surface_sub_grade']:
-        v1 = result1.get(key, 10)
-        v2 = result2.get(key, 10)
-        combined[key] = min(v1, v2)
-    
-    # Final grade = lowest sub-grade
-    sub_grades = [combined.get(k, 10) for k in 
-                  ['centering_sub_grade', 'corners_sub_grade', 'edges_sub_grade', 'surface_sub_grade']]
-    final = min(sub_grades)
-    combined['estimated_grade_single'] = final
-    combined['estimated_grade_range'] = f"PSA {max(final-1, 1)}-{final}"
-    
-    p1 = result1.get('psa_10_probability', 0)
-    p2 = result2.get('psa_10_probability', 0)
-    combined['psa_10_probability'] = min(p1, p2)
-    
-    # Merge lists without duplicates
-    issues1 = result1.get('key_issues', [])
-    issues2 = result2.get('key_issues', [])
-    combined['key_issues'] = list(dict.fromkeys(issues1 + issues2))
-    
-    missing1 = result1.get('missing_angles', [])
-    missing2 = result2.get('missing_angles', [])
-    combined['missing_angles'] = list(dict.fromkeys(missing1 + missing2))
-    
-    notes1 = result1.get('detailed_notes', '')
-    notes2 = result2.get('detailed_notes', '')
-    combined['detailed_notes'] = f"{notes1}\n\nAdditional observations: {notes2}"
-    
-    # Recommendation based on final grade
-    if final >= 9:
-        combined['recommendation'] = "Send for Grading"
-    elif final >= 7:
-        combined['recommendation'] = "Hold"
-    else:
-        combined['recommendation'] = "Pass"
-    
-    # Use lower confidence
-    conf_priority = {"Low": 0, "Medium": 1, "High": 2}
-    c1 = conf_priority.get(result1.get('confidence', 'Medium'), 1)
-    c2 = conf_priority.get(result2.get('confidence', 'Medium'), 1)
-    priority_to_conf = {0: "Low", 1: "Medium", 2: "High"}
-    combined['confidence'] = priority_to_conf[min(c1, c2)]
-    
-    return combined
-
-
-def _parse_grading_response(result_text):
-    """Parse the AI response text into a structured result dict."""
     try:
-        # Try to extract JSON from markdown code block
-        if '```json' in result_text:
-            json_start = result_text.find('```json') + 7
-            json_end = result_text.find('```', json_start)
-            json_text = result_text[json_start:json_end].strip()
-        elif '```' in result_text:
-            json_start = result_text.find('```') + 3
-            json_end = result_text.find('```', json_start)
-            json_text = result_text[json_start:json_end].strip()
+        # Extract grade estimates using regex
+        import re
+        
+        result = {
+            "full_analysis": result_text,
+            "estimated_grade_single": None,
+            "estimated_grade_range": None,
+            "recommendation": None,
+            "confidence": "Medium"
+        }
+        
+        # Try to extract "Most Likely: PSA X"
+        most_likely = re.search(r'Most Likely:?\s*PSA\s*(\d+)', result_text, re.IGNORECASE)
+        if most_likely:
+            result["estimated_grade_single"] = int(most_likely.group(1))
+        
+        # Try to extract grade range
+        floor = re.search(r'Floor:?\s*PSA\s*(\d+)', result_text, re.IGNORECASE)
+        ceiling = re.search(r'Ceiling:?\s*PSA\s*(\d+)', result_text, re.IGNORECASE)
+        
+        if floor and ceiling:
+            result["estimated_grade_range"] = f"PSA {floor.group(1)}-{ceiling.group(1)}"
+        elif result["estimated_grade_single"]:
+            grade = result["estimated_grade_single"]
+            result["estimated_grade_range"] = f"PSA {max(grade-1, 1)}-{min(grade+1, 10)}"
+        
+        # Extract recommendation
+        if re.search(r'submit\s+candidate', result_text, re.IGNORECASE):
+            result["recommendation"] = "Send for Grading"
+        elif re.search(r'\bhold\b', result_text, re.IGNORECASE):
+            result["recommendation"] = "Hold"
+        elif re.search(r'\bpass\b', result_text, re.IGNORECASE):
+            result["recommendation"] = "Pass"
         else:
-            # Try to find JSON object directly
-            start = result_text.find('{')
-            end = result_text.rfind('}') + 1
-            if start != -1 and end > start:
-                json_text = result_text[start:end]
-            else:
-                json_text = result_text.strip()
-        
-        result = json.loads(json_text)
-        
-        # Validate required fields exist
-        required_fields = ['estimated_grade_single', 'recommendation']
-        for field in required_fields:
-            if field not in result:
-                return {"error": "Incomplete response from AI", "raw_response": result_text}
+            # Infer from grade
+            if result["estimated_grade_single"]:
+                if result["estimated_grade_single"] >= 9:
+                    result["recommendation"] = "Send for Grading"
+                elif result["estimated_grade_single"] >= 7:
+                    result["recommendation"] = "Hold"
+                else:
+                    result["recommendation"] = "Pass"
         
         return result
         
-    except json.JSONDecodeError:
-        return {"error": "Failed to parse AI response", "raw_response": result_text}
+    except Exception as e:
+        return {
+            "full_analysis": result_text,
+            "error": f"Parsing error: {str(e)}"
+        }
 
 
 def display_grading_report(result):
-    """Display the grading report in a nice format"""
-    if "error" in result:
+    """Display the detailed grading report"""
+    if "error" in result and not result.get("full_analysis"):
         st.error(f"Analysis Error: {result['error']}")
-        if "raw_response" in result:
-            st.text_area("Raw Response:", result['raw_response'], height=300)
         return
     
-    # Validate: final grade must equal lowest sub-grade
-    sub_grades = [
-        result.get('centering_sub_grade'),
-        result.get('corners_sub_grade'),
-        result.get('edges_sub_grade'),
-        result.get('surface_sub_grade')
-    ]
-    valid_sub_grades = [g for g in sub_grades if g is not None]
-    if valid_sub_grades:
-        lowest = min(valid_sub_grades)
-        reported = result.get('estimated_grade_single', lowest)
-        # Enforce: final grade cannot be higher than lowest sub-grade
-        if reported > lowest:
-            result['estimated_grade_single'] = lowest
-            result['estimated_grade_range'] = f"PSA {max(lowest - 1, 1)}-{lowest}"
-        # Enforce recommendation based on corrected grade
-        grade = result['estimated_grade_single']
-        if grade >= 9:
-            result['recommendation'] = "Send for Grading"
-        elif grade >= 7:
-            result['recommendation'] = "Hold"
-        else:
-            result['recommendation'] = "Pass"
+    # Display grade summary box if we have estimates
+    if result.get("estimated_grade_single"):
+        st.markdown('<div class="grade-box">', unsafe_allow_html=True)
+        st.markdown(f'<div class="grade-number">PSA {result["estimated_grade_single"]}</div>', unsafe_allow_html=True)
+        if result.get("estimated_grade_range"):
+            st.markdown(f'**Estimated Range:** {result["estimated_grade_range"]}', unsafe_allow_html=True)
+        st.markdown(f'**Confidence:** {result.get("confidence", "Medium")}', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
     
-    # Main Grade Display
-    st.markdown('<div class="grade-box">', unsafe_allow_html=True)
-    st.markdown(f'<div class="grade-number">PSA {result.get("estimated_grade_single", "?")}</div>', unsafe_allow_html=True)
-    st.markdown(f'**Estimated Range:** {result.get("estimated_grade_range", "N/A")}', unsafe_allow_html=True)
-    st.markdown(f'**PSA 10 Probability:** {int(result.get("psa_10_probability", 0) * 100)}%', unsafe_allow_html=True)
-    st.markdown(f'**Confidence:** {result.get("confidence", "N/A")}', unsafe_allow_html=True)
+    # Display full detailed analysis
+    st.markdown('<div class="section-header">Detailed Analysis</div>', unsafe_allow_html=True)
+    st.markdown('<div class="analysis-section">', unsafe_allow_html=True)
+    st.markdown(result.get("full_analysis", "No analysis available"))
     st.markdown('</div>', unsafe_allow_html=True)
     
-    # Sub-Grades Display
-    if valid_sub_grades:
-        st.markdown('<div class="section-header">Sub-Grade Scores</div>', unsafe_allow_html=True)
-        sg_cols = st.columns(4)
-        sub_grade_labels = [
-            ("Centering", result.get('centering_sub_grade', 'N/A')),
-            ("Corners", result.get('corners_sub_grade', 'N/A')),
-            ("Edges", result.get('edges_sub_grade', 'N/A')),
-            ("Surface", result.get('surface_sub_grade', 'N/A'))
-        ]
-        for i, (label, grade) in enumerate(sub_grade_labels):
-            with sg_cols[i]:
-                color = "#00C851" if grade >= 9 else "#ffaa00" if grade >= 7 else "#ff4444"
-                st.markdown(f'<div style="text-align:center;padding:0.5rem;border-radius:8px;'
-                           f'background-color:{color};color:white;font-weight:bold;">'
-                           f'{label}<br><span style="font-size:1.5rem;">{grade}</span></div>',
-                           unsafe_allow_html=True)
-        
-        st.caption("Final grade is determined by the lowest sub-grade score.")
-    
-    # Detailed Analysis
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown('<div class="section-header">Centering</div>', unsafe_allow_html=True)
-        st.write(f"**Front:** {result.get('centering_front', 'N/A')}")
-        st.write(f"**Back:** {result.get('centering_back', 'N/A')}")
-        
-        st.markdown('<div class="section-header">Corners</div>', unsafe_allow_html=True)
-        st.write(result.get('corners', 'N/A'))
-        
-        st.markdown('<div class="section-header">Edges</div>', unsafe_allow_html=True)
-        st.write(result.get('edges', 'N/A'))
-    
-    with col2:
-        st.markdown('<div class="section-header">Surface</div>', unsafe_allow_html=True)
-        st.write(result.get('surface', 'N/A'))
-        
-        st.markdown('<div class="section-header">Key Issues</div>', unsafe_allow_html=True)
-        issues = result.get('key_issues', [])
-        if issues:
-            for issue in issues:
-                st.write(f"- {issue}")
+    # Display recommendation
+    if result.get("recommendation"):
+        st.markdown('<div class="section-header">Final Recommendation</div>', unsafe_allow_html=True)
+        recommendation = result["recommendation"]
+        if recommendation == "Send for Grading":
+            st.markdown(f'<div class="recommendation-grade">{recommendation}</div>', unsafe_allow_html=True)
+        elif recommendation == "Hold":
+            st.markdown(f'<div class="recommendation-hold">{recommendation}</div>', unsafe_allow_html=True)
         else:
-            st.write("No major issues detected")
-        
-        st.markdown('<div class="section-header">Missing Angles</div>', unsafe_allow_html=True)
-        missing = result.get('missing_angles', [])
-        if missing:
-            for angle in missing:
-                st.write(f"- {angle}")
-        else:
-            st.write("All necessary angles covered")
-    
-    # Detailed Notes
-    st.markdown('<div class="section-header">Detailed Analysis</div>', unsafe_allow_html=True)
-    st.write(result.get('detailed_notes', 'N/A'))
-    
-    # Recommendation
-    st.markdown('<div class="section-header">Final Recommendation</div>', unsafe_allow_html=True)
-    recommendation = result.get('recommendation', 'N/A')
-    if recommendation == "Send for Grading":
-        st.markdown(f'<div class="recommendation-grade">{recommendation}</div>', unsafe_allow_html=True)
-    elif recommendation == "Hold":
-        st.markdown(f'<div class="recommendation-hold">{recommendation}</div>', unsafe_allow_html=True)
-    else:
-        st.markdown(f'<div class="recommendation-pass">{recommendation}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="recommendation-pass">{recommendation}</div>', unsafe_allow_html=True)
+
 
 # Main App
-st.markdown('<div class="main-header">Trading Card Grader AI</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Estimate PSA grades from eBay listings or uploaded photos</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-header"> Trading Card Grader AI</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Detailed PSA grading analysis from eBay listings or uploaded photos</div>', unsafe_allow_html=True)
 
-# API Key Input (check .env first, then allow manual input)
+# API Key Input
 api_key_from_env = os.getenv('OPENAI_API_KEY')
 
 st.markdown("---")
-with st.expander("OpenAI API Key", expanded=not api_key_from_env):
+with st.expander("🔑 OpenAI API Key", expanded=not api_key_from_env):
     if api_key_from_env:
-        st.success("API key loaded from .env file")
+        st.success(" API key loaded from .env file")
         use_env_key = st.checkbox("Use API key from .env file", value=True)
         if use_env_key:
             api_key = api_key_from_env
@@ -598,7 +460,7 @@ with st.expander("OpenAI API Key", expanded=not api_key_from_env):
 st.markdown("---")
 
 # Main content tabs
-tab1, tab2 = st.tabs(["eBay URL", "Upload Photos"])
+tab1, tab2 = st.tabs([" eBay URL", " Upload Photos"])
 
 with tab1:
     st.subheader("Enter eBay Listing URL")
@@ -614,7 +476,6 @@ with tab1:
                 if image_urls:
                     st.success(f"Found {len(image_urls)} images!")
                     
-                    # Download and store images
                     st.session_state.images = []
                     cols = st.columns(4)
                     for idx, img_url in enumerate(image_urls):
@@ -622,7 +483,7 @@ with tab1:
                         if img:
                             st.session_state.images.append(img)
                             with cols[idx % 4]:
-                                st.image(img, caption=f"Image {idx+1}", use_column_width=True)
+                                st.image(img, caption=f"Image {idx+1}", use_container_width=True)
                 else:
                     st.error("No images found. Please check the URL or try manual upload.")
 
@@ -647,20 +508,20 @@ with tab2:
 st.markdown("---")
 
 if st.session_state.images:
-    st.subheader(f"Ready to analyze {len(st.session_state.images)} images")
+    st.subheader(f" Ready to analyze {len(st.session_state.images)} images")
     
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        if st.button("Analyze Card", key="analyze_btn", use_container_width=True):
+        if st.button(" Analyze Card", key="analyze_btn", use_container_width=True):
             if not api_key:
                 st.error("Please enter your OpenAI API key above to analyze the card.")
             else:
-                with st.spinner("Analyzing card images... This may take 20-30 seconds..."):
+                with st.spinner(" Analyzing card images... This may take 30-60 seconds for detailed analysis..."):
                     result = analyze_card_with_openai(st.session_state.images, api_key)
                     st.session_state.analysis_result = result
 
 # Display results
 if st.session_state.analysis_result:
     st.markdown("---")
-    st.markdown("## Grading Report")
+    st.markdown("##  Grading Report")
     display_grading_report(st.session_state.analysis_result)
