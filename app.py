@@ -440,22 +440,16 @@ def display_grading_report(result):
 st.markdown('<div class="main-header"> Trading Card Grader AI</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">Detailed PSA grading analysis from eBay listings or uploaded photos</div>', unsafe_allow_html=True)
 
-# API Key Input
-api_key_from_env = os.getenv('OPENAI_API_KEY')
-
-st.markdown("---")
-with st.expander("🔑 OpenAI API Key", expanded=not api_key_from_env):
-    if api_key_from_env:
-        st.success(" API key loaded from .env file")
-        use_env_key = st.checkbox("Use API key from .env file", value=True)
-        if use_env_key:
-            api_key = api_key_from_env
-        else:
-            api_key = st.text_input("Or enter API key manually:", type="password", key="manual_api_key")
-    else:
-        st.info("No API key found in .env file. Please enter your OpenAI API key below.")
-        api_key = st.text_input("OpenAI API Key:", type="password", key="api_key_input", 
-                                help="Get your API key from https://platform.openai.com/api-keys")
+# API Key - Get from Streamlit Cloud secrets
+try:
+    # Try to get from Streamlit Cloud secrets first (production)
+    api_key = st.secrets["openai"]["api_key"]
+except (KeyError, FileNotFoundError):
+    # Fallback to .env for local development
+    api_key = os.getenv('OPENAI_API_KEY')
+    if not api_key:
+        st.error(" API Key not configured. Please contact the administrator.")
+        st.stop()
 
 st.markdown("---")
 
@@ -516,7 +510,7 @@ if st.session_state.images:
             if not api_key:
                 st.error("Please enter your OpenAI API key above to analyze the card.")
             else:
-                with st.spinner(" Analyzing card images... This may take 30-60 seconds for detailed analysis..."):
+                with st.spinner("🤖 Analyzing card images... This may take 30-60 seconds for detailed analysis..."):
                     result = analyze_card_with_openai(st.session_state.images, api_key)
                     st.session_state.analysis_result = result
 
