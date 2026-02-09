@@ -84,63 +84,101 @@ if 'analysis_result' not in st.session_state:
     st.session_state.analysis_result = None
 
 def extract_ebay_images(url):
-    """Extract images from eBay listing"""
+    """Extract images from eBay listing using multiple fallback methods"""
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Connection': 'keep-alive',
         }
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         
         soup = BeautifulSoup(response.content, 'html.parser')
-        
-        # Find all image carousel items
         image_urls = []
         
-        # Method 1: Look for data-zoom-src (highest quality)
+        # Method 1: ux-image-carousel-item (most common)
         carousel_items = soup.find_all('div', class_='ux-image-carousel-item')
         for item in carousel_items:
             img = item.find('img')
             if img:
-                # Try data-zoom-src first (s-l1600.webp - highest quality)
-                zoom_src = img.get('data-zoom-src')
-                if zoom_src:
-                    image_urls.append(zoom_src)
-                    continue
-                
-                # Fallback to src
-                src = img.get('src')
-                if src and 'ebayimg.com' in src:
-                    # Try to upgrade to highest quality
-                    if 's-l500' in src:
-                        src = src.replace('s-l500', 's-l1600')
-                    elif 's-l960' in src:
-                        src = src.replace('s-l960', 's-l1600')
-                    image_urls.append(src)
-        
-        # Method 2: Fallback - find all img tags with ebayimg
-        if not image_urls:
-            all_imgs = soup.find_all('img', src=lambda x: x and 'ebayimg.com' in x)
-            for img in all_imgs:
-                src = img.get('src')
-                if 's-l' in src:  # Only get product images
-                    if 's-l500' in src or 's-l960' in src:
-                        src = src.replace('s-l500', 's-l1600').replace('s-l960', 's-l1600')
-                    if src not in image_urls:
+                # Try multiple attributes
+                for attr in ['data-zoom-src', 'data-src', 'src']:
+                    src = img.get(attr)
+                    if src and 'ebayimg.com' in src:
                         image_urls.append(src)
+                        break
+        
+        # Method 2: Look for picture tags
+        if not image_urls:
+            pictures = soup.find_all('picture')
+            for pic in pictures:
+                img = pic.find('img')
+                if img:
+                    for attr in ['src', 'data-src', 'data-zoom-src']:
+                        src = img.get(attr)
+                        if src and 'ebayimg.com' in src:
+                            image_urls.append(src)
+                            break
+        
+        # Method 3: Find all img tags with ebayimg
+        if not image_urls:
+            all_imgs = soup.find_all('img')
+            for img in all_imgs:
+                for attr in ['src', 'data-src', 'data-zoom-src']:
+                    src = img.get(attr)
+                    if src and 'ebayimg.com' in src and 's-l' in src:
+                        image_urls.append(src)
+                        break
+        
+        # Method 4: Look in script tags for image URLs (JSON data)
+        if not image_urls:
+            scripts = soup.find_all('script', type='application/ld+json')
+            for script in scripts:
+                try:
+                    data = json.loads(script.string)
+                    if isinstance(data, dict) and 'image' in data:
+                        imgs = data['image']
+                        if isinstance(imgs, str):
+                            image_urls.append(imgs)
+                        elif isinstance(imgs, list):
+                            image_urls.extend(imgs)
+                except:
+                    pass
+        
+        # Clean and upgrade URLs to highest quality
+        cleaned_urls = []
+        for img_url in image_urls:
+            # Upgrade to s-l1600 (highest quality)
+            for size in ['s-l50', 's-l100', 's-l225', 's-l300', 's-l400', 's-l500', 
+                        's-l640', 's-l960', 's-l1200']:
+                if size in img_url:
+                    img_url = img_url.replace(size, 's-l1600')
+                    break
+            
+            # Only add if it's a product image
+            if 'ebayimg.com' in img_url and 's-l' in img_url:
+                cleaned_urls.append(img_url)
         
         # Remove duplicates while preserving order
         seen = set()
         unique_urls = []
-        for url in image_urls:
-            if url not in seen:
-                seen.add(url)
-                unique_urls.append(url)
+        for img_url in cleaned_urls:
+            if img_url not in seen:
+                seen.add(img_url)
+                unique_urls.append(img_url)
         
-        return unique_urls[:10]  # Limit to 10 images max
+        result = unique_urls[:10]  # Limit to 10 images max
+        
+        if not result:
+            st.warning("Could not extract images from this eBay listing. The page structure may have changed. Please try manual upload instead.")
+        
+        return result
         
     except Exception as e:
         st.error(f"Error extracting images: {str(e)}")
+        st.info("Tip: Copy and paste the direct eBay item page URL, not a search results page.")
         return []
 
 def download_image(url):
@@ -540,8 +578,24 @@ def display_grading_report(result):
 st.markdown('<div class="main-header">Trading Card Grader AI</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">Estimate PSA grades from eBay listings or uploaded photos</div>', unsafe_allow_html=True)
 
-# Get API key from environment
-api_key = os.getenv('OPENAI_API_KEY')
+# API Key Input (check .env first, then allow manual input)
+api_key_from_env = os.getenv('OPENAI_API_KEY')
+
+st.markdown("---")
+with st.expander("OpenAI API Key", expanded=not api_key_from_env):
+    if api_key_from_env:
+        st.success("API key loaded from .env file")
+        use_env_key = st.checkbox("Use API key from .env file", value=True)
+        if use_env_key:
+            api_key = api_key_from_env
+        else:
+            api_key = st.text_input("Or enter API key manually:", type="password", key="manual_api_key")
+    else:
+        st.info("No API key found in .env file. Please enter your OpenAI API key below.")
+        api_key = st.text_input("OpenAI API Key:", type="password", key="api_key_input", 
+                                help="Get your API key from https://platform.openai.com/api-keys")
+
+st.markdown("---")
 
 # Main content tabs
 tab1, tab2 = st.tabs(["eBay URL", "Upload Photos"])
@@ -599,7 +653,7 @@ if st.session_state.images:
     with col2:
         if st.button("Analyze Card", key="analyze_btn", use_container_width=True):
             if not api_key:
-                st.error("OpenAI API key not found. Please add OPENAI_API_KEY to your .env file.")
+                st.error("Please enter your OpenAI API key above to analyze the card.")
             else:
                 with st.spinner("Analyzing card images... This may take 20-30 seconds..."):
                     result = analyze_card_with_openai(st.session_state.images, api_key)
