@@ -622,7 +622,7 @@ with tab1:
                         if img:
                             st.session_state.images.append(img)
                             with cols[idx % 4]:
-                                st.image(img, caption=f"Image {idx+1}", use_container_width=True)
+                                st.image(img, caption=f"Image {idx+1}", use_column_width=True)
                 else:
                     st.error("No images found. Please check the URL or try manual upload.")
 
